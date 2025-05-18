@@ -10,6 +10,7 @@ use std::{
 };
 
 use futures::Stream;
+use smoltcp::iface::PollResult;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::Device,
@@ -200,7 +201,7 @@ impl TcpListenerRunner {
 
             let before_poll = Instant::now();
             let updated_sockets = iface.poll(before_poll, &mut device, &mut socket_set);
-            if updated_sockets {
+            if updated_sockets != PollResult::None {
                 trace!("VirtDevice::poll costed {}", Instant::now() - before_poll);
             }
 
