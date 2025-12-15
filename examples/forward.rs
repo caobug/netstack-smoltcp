@@ -1,7 +1,8 @@
-use std::net::{IpAddr, SocketAddr};
-
+use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
+use netstack_smoltcp::udp::UdpMessage;
 use netstack_smoltcp::{StackBuilder, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use structopt::StructOpt;
 use tokio::net::{TcpSocket, TcpStream};
 use tracing::{error, info, warn};
@@ -90,8 +91,8 @@ async fn main_exec(opt: Opt) {
     )
     .unwrap();
 
-    let mut cfg = tun2::Configuration::default();
-    cfg.layer(tun2::Layer::L3);
+    let mut cfg = tun::Configuration::default();
+    cfg.layer(tun::Layer::L3);
     let fd = -1;
     if fd >= 0 {
         cfg.raw_fd(fd);
@@ -99,7 +100,7 @@ async fn main_exec(opt: Opt) {
         cfg.tun_name(&opt.name)
             .address("10.10.10.2")
             .destination("10.10.10.1")
-            .mtu(tun2::DEFAULT_MTU);
+            .mtu(tun::DEFAULT_MTU);
         #[cfg(not(any(target_arch = "mips", target_arch = "mips64",)))]
         {
             cfg.netmask("255.255.255.0");
@@ -107,7 +108,7 @@ async fn main_exec(opt: Opt) {
         cfg.up();
     }
 
-    let device = tun2::create_as_async(&cfg).unwrap();
+    let device = tun::create_as_async(&cfg).unwrap();
     let mut builder = StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
@@ -126,33 +127,12 @@ async fn main_exec(opt: Opt) {
         tokio_spawn!(runner);
     }
 
-    let framed = device.into_framed();
-    let (mut tun_sink, mut tun_stream) = framed.split();
-    let (mut stack_sink, mut stack_stream) = stack.split();
-
     let mut futs = vec![];
 
-    // Reads packet from stack and sends to TUN.
+    // Copy packets between TUN and stack
     futs.push(tokio_spawn!(async move {
-        while let Some(pkt) = stack_stream.next().await {
-            if let Ok(pkt) = pkt {
-                match tun_sink.send(pkt).await {
-                    Ok(_) => {}
-                    Err(e) => warn!("failed to send packet to TUN, err: {:?}", e),
-                }
-            }
-        }
-    }));
-
-    // Reads packet from TUN and sends to stack.
-    futs.push(tokio_spawn!(async move {
-        while let Some(pkt) = tun_stream.next().await {
-            if let Ok(pkt) = pkt {
-                match stack_sink.send(pkt).await {
-                    Ok(_) => {}
-                    Err(e) => warn!("failed to send packet to stack, err: {:?}", e),
-                };
-            }
+        if let Err(err) = stack.copy_bidirectional(device.into_framed()).await {
+            warn!(%err, "failed to copy packets between TUN and stack");
         }
     }));
 
@@ -211,25 +191,32 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
     tokio::spawn(async move {
-        while let Some((data, local, remote)) = rx.recv().await {
-            let _ = write_half.send((data, remote, local)).await;
+        while let Some(message) = rx.recv().await {
+            let _ = write_half.send(message).await;
         }
     });
 
-    while let Some((data, local, remote)) = read_half.next().await {
+    while let Some(message) = read_half.next().await {
         let tx = tx.clone();
         let interface = interface.clone();
+        let local = message.local_addr;
+        let remote = message.remote_addr;
         tokio::spawn(async move {
             info!("new udp datagram: {:?} => {:?}", local, remote);
             match new_udp_packet(remote, &interface).await {
                 Ok(remote_socket) => {
                     // pipe between two udp sockets
-                    let _ = remote_socket.send(&data).await;
+                    let _ = remote_socket.send(&message.payload).await;
+                    let mut buf = BytesMut::with_capacity(1024);
                     loop {
-                        let mut buf = vec![0; 1024];
-                        match remote_socket.recv_from(&mut buf).await {
-                            Ok((len, _)) => {
-                                let _ = tx.send((buf[..len].to_vec(), local, remote));
+                        buf.reserve(1024);
+                        match remote_socket.recv_buf_from(&mut buf).await {
+                            Ok(_) => {
+                                let _ = tx.send(UdpMessage {
+                                    payload: buf.split().freeze(),
+                                    local_addr: remote,
+                                    remote_addr: local,
+                                });
                             }
                             Err(e) => {
                                 warn!(
@@ -278,10 +265,10 @@ async fn new_udp_packet(addr: SocketAddr, iface: &str) -> std::io::Result<tokio:
     socket
 }
 
-fn get_device_broadcast(device: &tun2::AsyncDevice) -> Option<std::net::Ipv4Addr> {
-    use tun2::AbstractDevice;
+fn get_device_broadcast(device: &tun::AsyncDevice) -> Option<std::net::Ipv4Addr> {
+    use tun::AbstractDevice;
 
-    let mtu = device.mtu().unwrap_or(tun2::DEFAULT_MTU);
+    let mtu = device.mtu().unwrap_or(tun::DEFAULT_MTU);
 
     let address = match device.address() {
         Ok(a) => match a {

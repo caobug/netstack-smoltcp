@@ -1,23 +1,57 @@
+use bytes::Bytes;
+use etherparse::PacketBuilder;
+use futures::{ready, Sink, SinkExt, Stream};
+use smoltcp::wire::UdpPacket;
 use std::{
+    fmt, mem,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
 };
-
-use etherparse::PacketBuilder;
-use futures::{ready, Sink, SinkExt, Stream};
-use smoltcp::wire::UdpPacket;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::PollSender;
-use tracing::{error, trace};
+use tracing::trace;
 
 use crate::packet::{AnyIpPktFrame, IpPacket};
 
-pub type UdpMsg = (
-    Vec<u8>,    /* payload */
-    SocketAddr, /* local */
-    SocketAddr, /* remote */
-);
+pub struct UdpMessage {
+    pub payload: Bytes,
+    pub local_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
+}
+
+impl UdpMessage {
+    /// Flips the local and remote addresses, reversing message direction.
+    pub fn flip(mut self) -> Self {
+        mem::swap(&mut self.local_addr, &mut self.remote_addr);
+        self
+    }
+}
+
+#[derive(Debug)]
+pub enum UdpError {
+    AddressTypeMismatch,
+    ChannelSendError,
+    IoError(std::io::Error),
+}
+
+impl fmt::Display for UdpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UdpError::AddressTypeMismatch => write!(f, "Address type mismatch"),
+            UdpError::ChannelSendError => write!(f, "Channel send error"),
+            UdpError::IoError(e) => write!(f, "IO error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for UdpError {}
+
+impl From<std::io::Error> for UdpError {
+    fn from(e: std::io::Error) -> Self {
+        UdpError::IoError(e)
+    }
+}
 
 pub struct UdpSocket {
     udp_rx: Receiver<AnyIpPktFrame>,
@@ -53,100 +87,103 @@ pub struct WriteHalf {
 }
 
 impl Stream for ReadHalf {
-    type Item = UdpMsg;
+    type Item = UdpMessage;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        self.udp_rx.poll_recv(cx).map(|item| {
-            item.and_then(|frame| {
-                let packet = match IpPacket::new_checked(frame.as_slice()) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        error!("invalid IP packet: {}", err);
-                        return None;
+        loop {
+            match ready!(self.udp_rx.poll_recv(cx)) {
+                Some(frame) => {
+                    if let Some(msg) = Self::process_frame_fast(frame) {
+                        return Poll::Ready(Some(msg));
                     }
-                };
+                    // Continue loop to try next frame
+                }
+                None => return Poll::Ready(None),
+            }
+        }
+    }
+}
 
-                let src_ip = packet.src_addr();
-                let dst_ip = packet.dst_addr();
-                let payload = packet.payload();
+impl ReadHalf {
+    #[inline]
+    fn process_frame_fast(frame: AnyIpPktFrame) -> Option<UdpMessage> {
+        let slice = frame.as_slice();
 
-                let packet = match UdpPacket::new_checked(payload) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        error!("invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload: {payload:?}");
-                        return None;
-                    }
-                };
-                let src_port = packet.src_port();
-                let dst_port = packet.dst_port();
+        let ip_packet = IpPacket::new_checked(slice).ok()?;
+        let udp_slice = ip_packet.payload();
+        let udp_packet = UdpPacket::new_checked(udp_slice).ok()?;
 
-                let src_addr = SocketAddr::new(src_ip, src_port);
-                let dst_addr = SocketAddr::new(dst_ip, dst_port);
+        let src_addr = SocketAddr::new(ip_packet.src_addr(), udp_packet.src_port());
+        let dst_addr = SocketAddr::new(ip_packet.dst_addr(), udp_packet.dst_port());
 
-                trace!("created UDP socket for {} <-> {}", src_addr, dst_addr);
+        let payload = Bytes::copy_from_slice(udp_packet.payload());
 
-                Some((packet.payload().to_vec(), src_addr, dst_addr))
-            })
+        trace!("UDP {} -> {}, {} bytes", src_addr, dst_addr, payload.len());
+
+        Some(UdpMessage {
+            payload,
+            local_addr: src_addr,
+            remote_addr: dst_addr,
         })
     }
 }
 
-impl Sink<UdpMsg> for WriteHalf {
-    type Error = std::io::Error;
+impl Sink<UdpMessage> for WriteHalf {
+    type Error = UdpError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match ready!(self.stack_tx.poll_ready_unpin(cx)) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(err) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, err))),
-        }
+        self.stack_tx
+            .poll_ready_unpin(cx)
+            .map_err(|_| UdpError::ChannelSendError)
     }
 
-    fn start_send(mut self: Pin<&mut Self>, item: UdpMsg) -> Result<(), Self::Error> {
-        use std::io::{Error, ErrorKind::InvalidData, ErrorKind::Other};
-        let (data, src_addr, dst_addr) = item;
-
-        if data.is_empty() {
+    fn start_send(mut self: Pin<&mut Self>, msg: UdpMessage) -> Result<(), Self::Error> {
+        if msg.payload.is_empty() {
             return Ok(());
         }
 
-        let builder = match (src_addr, dst_addr) {
-            (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
-                PacketBuilder::ipv4(src.ip().octets(), dst.ip().octets(), 20)
-                    .udp(src_addr.port(), dst_addr.port())
-            }
-            (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
-                PacketBuilder::ipv6(src.ip().octets(), dst.ip().octets(), 20)
-                    .udp(src_addr.port(), dst_addr.port())
-            }
-            _ => {
-                return Err(Error::new(InvalidData, "src or destination type unmatch"));
-            }
-        };
+        let packet_data = self.build_packet(&msg)?;
 
-        let mut ip_packet_writer = Vec::with_capacity(builder.size(data.len()));
-        builder
-            .write(&mut ip_packet_writer, &data)
-            .map_err(|err| Error::new(Other, format!("PacketBuilder::write: {}", err)))?;
-
-        match self.stack_tx.start_send_unpin(ip_packet_writer.clone()) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(Error::new(Other, format!("send error: {}", err))),
-        }
+        self.stack_tx
+            .start_send_unpin(packet_data)
+            .map_err(|_| UdpError::ChannelSendError)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        use std::io::{Error, ErrorKind::Other};
-        match ready!(self.stack_tx.poll_flush_unpin(cx)) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(err) => Poll::Ready(Err(Error::new(Other, format!("flush error: {}", err)))),
-        }
+        self.stack_tx
+            .poll_flush_unpin(cx)
+            .map_err(|_| UdpError::ChannelSendError)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        use std::io::{Error, ErrorKind::Other};
-        match ready!(self.stack_tx.poll_close_unpin(cx)) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(err) => Poll::Ready(Err(Error::new(Other, format!("close error: {}", err)))),
-        }
+        self.stack_tx
+            .poll_close_unpin(cx)
+            .map_err(|_| UdpError::ChannelSendError)
+    }
+}
+
+impl WriteHalf {
+    #[inline]
+    fn build_packet(&self, msg: &UdpMessage) -> Result<Vec<u8>, UdpError> {
+        let builder = match (msg.local_addr, msg.remote_addr) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                PacketBuilder::ipv4(local.ip().octets(), remote.ip().octets(), 20)
+                    .udp(msg.local_addr.port(), msg.remote_addr.port())
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                PacketBuilder::ipv6(local.ip().octets(), remote.ip().octets(), 20)
+                    .udp(msg.local_addr.port(), msg.remote_addr.port())
+            }
+            _ => return Err(UdpError::AddressTypeMismatch),
+        };
+
+        let packet_size = builder.size(msg.payload.len());
+        let mut buffer = Vec::with_capacity(packet_size);
+
+        builder
+            .write(&mut buffer, &msg.payload)
+            .map_err(|e| UdpError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        Ok(buffer)
     }
 }

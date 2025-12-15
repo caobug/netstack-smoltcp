@@ -5,8 +5,12 @@ use std::{
 };
 
 use futures::{Sink, Stream};
+use futures::{SinkExt, StreamExt};
 use smoltcp::wire::IpProtocol;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use std::io::{Error, ErrorKind};
+use std::time::Duration;
+use tokio::sync::mpsc::{channel, Receiver};
+use tokio_util::sync::PollSender;
 use tracing::{debug, trace};
 
 use crate::{
@@ -141,9 +145,9 @@ impl StackBuilder {
             ip_filters: self.ip_filters,
             stack_rx,
             sink_buf: None,
-            udp_tx,
-            tcp_tx,
-            icmp_tx,
+            udp_tx: udp_tx.map(PollSender::new),
+            tcp_tx: tcp_tx.map(PollSender::new),
+            icmp_tx: icmp_tx.map(PollSender::new),
         };
 
         Ok((stack, tcp_runner, udp_socket, tcp_listener))
@@ -153,49 +157,140 @@ impl StackBuilder {
 pub struct Stack {
     ip_filters: IpFilters<'static>,
     sink_buf: Option<(AnyIpPktFrame, IpProtocol)>,
-    udp_tx: Option<Sender<AnyIpPktFrame>>,
-    tcp_tx: Option<Sender<AnyIpPktFrame>>,
-    icmp_tx: Option<Sender<AnyIpPktFrame>>,
+    udp_tx: Option<PollSender<AnyIpPktFrame>>,
+    tcp_tx: Option<PollSender<AnyIpPktFrame>>,
+    icmp_tx: Option<PollSender<AnyIpPktFrame>>,
     stack_rx: Receiver<AnyIpPktFrame>,
 }
 
 impl Stack {
-    fn poll_send(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        let (item, proto) = match self.sink_buf.take() {
-            Some(val) => val,
-            None => return Poll::Ready(Ok(())),
-        };
+    pub async fn copy_bidirectional<T>(self, other: T) -> Result<(), Error>
+    where
+        T: Stream<Item = std::io::Result<AnyIpPktFrame>>
+            + Sink<AnyIpPktFrame, Error = Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let (mut stack_sink, mut stack_stream) = self.split();
+        let (mut other_sink, mut other_stream) = other.split();
 
-        let ready_res = match proto {
-            IpProtocol::Tcp => self.tcp_tx.as_mut().map(|tx| tx.try_reserve()),
-            IpProtocol::Udp => self.udp_tx.as_mut().map(|tx| tx.try_reserve()),
-            IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                self.icmp_tx.as_mut().map(|tx| tx.try_reserve())
-            }
-            _ => unreachable!(),
-        };
+        tokio::select! {
+            // Copy from stack to other
+            result = async {
+                while let Some(pkt) = stack_stream.next().await {
+                    other_sink.send(pkt?).await?;
+                }
+                Ok(())
+            } => result,
 
-        let Some(ready_res) = ready_res else {
+            // Copy from other to stack
+            result = async {
+                while let Some(pkt) = other_stream.next().await {
+                    stack_sink.send(pkt?).await?;
+                }
+                Ok(())
+            } => result,
+        }
+    }
+
+    pub async fn copy_bidirectional_ignore_errors<T>(
+        self,
+        other: T,
+        error_backoff: Option<Duration>,
+    ) where
+        T: Stream<Item = std::io::Result<AnyIpPktFrame>>
+            + Sink<AnyIpPktFrame, Error = Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let (mut stack_sink, mut stack_stream) = self.split();
+        let (mut other_sink, mut other_stream) = other.split();
+
+        macro_rules! handle_error {
+            ($e:expr, $msg:expr) => {{
+                debug!("{}: {}", $msg, $e);
+                if let Some(duration) = error_backoff {
+                    tokio::time::sleep(duration).await;
+                }
+            }};
+        }
+
+        tokio::select! {
+            // Copy from stack to other
+            _ = async {
+                while let Some(pkt) = stack_stream.next().await {
+                    match pkt {
+                        Ok(frame) => {
+                            if let Err(e) = other_sink.send(frame).await {
+                                handle_error!(e, "Failed to send packet from stack to other");
+                            }
+                        }
+                        Err(e) => {
+                            handle_error!(e, "Failed to receive packet from stack");
+                        }
+                    }
+                }
+            } => {},
+
+            // Copy from other to stack
+            _ = async {
+                while let Some(pkt) = other_stream.next().await {
+                    match pkt {
+                        Ok(frame) => {
+                            if let Err(e) = stack_sink.send(frame).await {
+                                handle_error!(e, "Failed to send packet from other to stack");
+                            }
+                        }
+                        Err(e) => {
+                            handle_error!(e, "Failed to receive packet from other");
+                        }
+                    }
+                }
+            } => {},
+        }
+    }
+
+    /// Try to send the buffered packet to the appropriate channel.
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let Some((item, proto)) = self.sink_buf.take() else {
             return Poll::Ready(Ok(()));
         };
 
-        let permit = match ready_res {
-            Ok(permit) => permit,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.sink_buf.replace((item, proto));
-                return Poll::Pending;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Poll::Ready(Err(channel_closed_err("channel is closed")));
+        let tx = match proto {
+            IpProtocol::Tcp => self.tcp_tx.as_mut(),
+            IpProtocol::Udp => self.udp_tx.as_mut(),
+            IpProtocol::Icmp | IpProtocol::Icmpv6 => self.icmp_tx.as_mut(),
+            _ => {
+                debug!("Unexpected protocol in sink_buf: {:?}", proto);
+                return Poll::Ready(Ok(()));
             }
         };
 
-        permit.send(item);
-        Poll::Ready(Ok(()))
+        let Some(tx) = tx else {
+            // Channel is not enabled, drop the packet
+            return Poll::Ready(Ok(()));
+        };
+
+        match tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => match tx.send_item(item) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(_) => Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "channel is closed"))),
+            },
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "channel is closed")))
+            }
+            Poll::Pending => {
+                // Channel not ready yet, put packet back to buffer
+                self.sink_buf = Some((item, proto));
+                Poll::Pending
+            }
+        }
     }
 }
 
-// Recv from stack.
+// Receive packets from stack
 impl Stream for Stack {
     type Item = std::io::Result<AnyIpPktFrame>;
 
@@ -208,15 +303,19 @@ impl Stream for Stack {
     }
 }
 
-// Send to stack.
+// Send packets to stack
 impl Sink<AnyIpPktFrame> for Stack {
-    type Error = std::io::Error;
+    type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.sink_buf.is_none() {
-            Poll::Ready(Ok(()))
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.sink_buf.is_some() {
+            match self.poll_send(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         } else {
-            Poll::Pending
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -225,16 +324,19 @@ impl Sink<AnyIpPktFrame> for Stack {
             return Ok(());
         }
 
-        use std::io::{Error, ErrorKind::InvalidInput};
-        let packet = IpPacket::new_checked(item.as_slice())
-            .map_err(|err| Error::new(InvalidInput, format!("invalid IP packet: {}", err)))?;
+        let packet = IpPacket::new_checked(item.as_slice()).map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid IP packet: {}", err),
+            )
+        })?;
 
         let src_ip = packet.src_addr();
         let dst_ip = packet.dst_addr();
 
         let addr_allowed = self.ip_filters.is_allowed(&src_ip, &dst_ip);
         if !addr_allowed {
-            trace!("IP packet {src_ip} -> {dst_ip} (allowed? {addr_allowed}) throwing away",);
+            trace!("IP packet {src_ip} -> {dst_ip} dropped by filter");
             return Ok(());
         }
 
@@ -243,9 +345,9 @@ impl Sink<AnyIpPktFrame> for Stack {
             protocol,
             IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Icmp | IpProtocol::Icmpv6
         ) {
-            self.sink_buf.replace((item, protocol));
+            self.sink_buf = Some((item, protocol));
         } else {
-            debug!("tun IP packet ignored (protocol: {:?})", protocol);
+            debug!("IP packet ignored (protocol: {:?})", protocol);
         }
 
         Ok(())
@@ -255,18 +357,14 @@ impl Sink<AnyIpPktFrame> for Stack {
         self.poll_send(cx)
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.stack_rx.close();
-        Poll::Ready(Ok(()))
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.stack_rx.close();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
-}
-
-fn channel_closed_err<E>(err: E) -> std::io::Error
-where
-    E: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    std::io::Error::new(std::io::ErrorKind::BrokenPipe, err)
 }

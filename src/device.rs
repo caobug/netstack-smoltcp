@@ -3,6 +3,7 @@ use std::sync::{
     Arc,
 };
 
+use smoltcp::phy::Checksum;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
@@ -64,6 +65,11 @@ impl Device for VirtualDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
         capabilities.max_transmission_unit = 1504;
+        capabilities.checksum.ipv4 = Checksum::Tx;
+        capabilities.checksum.udp = Checksum::Tx;
+        capabilities.checksum.tcp = Checksum::Tx;
+        capabilities.checksum.icmpv4 = Checksum::Tx;
+        capabilities.checksum.icmpv6 = Checksum::Tx;
         capabilities
     }
 }

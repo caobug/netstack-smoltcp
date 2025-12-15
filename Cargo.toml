@@ -33,9 +33,10 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
 ] }
+bytes = "1"
 
 [dev-dependencies]
-tun2 = { version = "3", features = ["async"] }
+tun = { version = "0.7", features = ["async"] }
 tokio = { version = "1", features = [
     "rt",
     "macros",
