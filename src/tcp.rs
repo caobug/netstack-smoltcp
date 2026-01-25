@@ -94,6 +94,11 @@ impl SocketControl {
     fn ready_to_initiate_close(&self) -> bool {
         matches!(self.send_state, SocketState::Closing) && self.send_buffer.is_empty()
     }
+
+    fn is_stream_dropped(&self) -> bool {
+        matches!(self.send_state, SocketState::Closed)
+            && matches!(self.recv_state, SocketState::Closed)
+    }
 }
 
 struct NewConnection {
@@ -175,8 +180,6 @@ impl TcpListenerRunner {
                 conn_tx
                     .send(connection)
                     .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-
-                trace!("New connection: {} -> {}", src_addr, dst_addr);
             }
 
             Self::forward_packet(&iface_tx, &notify, frame)?;
@@ -251,7 +254,7 @@ impl TcpListenerRunner {
 
             let next_duration = iface
                 .poll_delay(poll_start, &socket_set)
-                .unwrap_or(Duration::from_millis(5));
+                .unwrap_or(Duration::from_millis(10));
 
             if next_duration != Duration::ZERO {
                 let _ = tokio::time::timeout(
@@ -279,36 +282,47 @@ impl TcpListenerRunner {
                 continue;
             }
 
-            Self::handle_socket_shutdown(&mut ctrl, socket);
-            Self::handle_socket_read(socket, &mut ctrl);
-            Self::handle_socket_write(socket, &mut ctrl);
+            Self::handle_application_close(&mut ctrl, socket);
+
+            if Self::should_force_cleanup(&ctrl, socket) {
+                socket.abort();
+                ctrl.close();
+                closed_sockets.push(handle);
+                continue;
+            }
+
+            Self::handle_socket_read(&mut ctrl, socket);
+            Self::handle_socket_write(&mut ctrl, socket);
+            Self::sync_control_state(&mut ctrl, socket);
         }
 
         closed_sockets
     }
 
-    fn handle_socket_shutdown(ctrl: &mut SocketControl, socket: &mut TcpSocket<'_>) {
-        if matches!(ctrl.send_state, SocketState::Closing) {
-            if ctrl.send_buffer.is_empty() && socket.may_send() {
-                socket.close();
-            }
+    fn handle_application_close(ctrl: &mut SocketControl, socket: &mut TcpSocket<'_>) {
+        let should_initiate_close = match ctrl.send_state {
+            SocketState::Closing => ctrl.send_buffer.is_empty(),
+            SocketState::Closed => ctrl.is_stream_dropped(),
+            SocketState::Active => socket.state() == TcpState::CloseWait,
+        };
 
-            let fin_sent_states = [
-                TcpState::FinWait1,
-                TcpState::FinWait2,
-                TcpState::Closing,
-                TcpState::TimeWait,
-                TcpState::LastAck,
-            ];
-
-            if fin_sent_states.contains(&socket.state()) {
-                ctrl.send_state = SocketState::Closed;
-                ctrl.wake_shutdown();
-            }
+        if should_initiate_close && socket.may_send() {
+            socket.close();
         }
     }
 
-    fn handle_socket_read(socket: &mut TcpSocket<'_>, ctrl: &mut SocketControl) {
+    fn should_force_cleanup(ctrl: &SocketControl, socket: &TcpSocket<'_>) -> bool {
+        ctrl.is_stream_dropped() && !socket.may_send()
+    }
+
+    fn sync_control_state(ctrl: &mut SocketControl, socket: &TcpSocket<'_>) {
+        if matches!(ctrl.send_state, SocketState::Closing) && !socket.may_send() {
+            ctrl.send_state = SocketState::Closed;
+            ctrl.wake_shutdown();
+        }
+    }
+
+    fn handle_socket_read(ctrl: &mut SocketControl, socket: &mut TcpSocket<'_>) {
         let mut should_wake = false;
 
         while socket.can_recv() && !ctrl.recv_buffer.is_full() {
@@ -326,16 +340,16 @@ impl TcpListenerRunner {
             }
         }
 
-        if matches!(ctrl.recv_state, SocketState::Active) && !socket.may_recv() {
-            let active_states = [
-                TcpState::Listen,
-                TcpState::SynReceived,
-                TcpState::Established,
-                TcpState::FinWait1,
-                TcpState::FinWait2,
-            ];
+        if matches!(ctrl.recv_state, SocketState::Active)
+            && !socket.may_recv()
+            && ctrl.recv_buffer.is_empty()
+        {
+            let in_handshake = matches!(
+                socket.state(),
+                TcpState::Listen | TcpState::SynSent | TcpState::SynReceived
+            );
 
-            if !active_states.contains(&socket.state()) {
+            if !in_handshake {
                 ctrl.recv_state = SocketState::Closed;
                 should_wake = true;
             }
@@ -346,7 +360,7 @@ impl TcpListenerRunner {
         }
     }
 
-    fn handle_socket_write(socket: &mut TcpSocket<'_>, ctrl: &mut SocketControl) {
+    fn handle_socket_write(ctrl: &mut SocketControl, socket: &mut TcpSocket<'_>) {
         let mut should_wake_sender = false;
         let mut should_wake_shutdown = false;
 
@@ -478,16 +492,20 @@ impl Drop for TcpStream {
         let mut ctrl = self.control.lock();
 
         if matches!(ctrl.send_state, SocketState::Active) {
-            if ctrl.send_buffer.is_empty() {
-                ctrl.send_state = SocketState::Closed;
+            ctrl.send_state = if ctrl.send_buffer.is_empty() {
+                SocketState::Closed
             } else {
-                ctrl.send_state = SocketState::Closing;
-            }
+                SocketState::Closing
+            };
         }
 
         if matches!(ctrl.recv_state, SocketState::Active) {
             ctrl.recv_state = SocketState::Closed;
         }
+
+        ctrl.wake_sender();
+        ctrl.wake_receiver();
+        ctrl.wake_shutdown();
 
         self.notify.notify_one();
     }
