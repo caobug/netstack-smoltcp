@@ -1,8 +1,3 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
 use smoltcp::phy::Checksum;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -13,25 +8,19 @@ use tokio::sync::mpsc::{unbounded_channel, Permit, Sender, UnboundedReceiver, Un
 use crate::packet::AnyIpPktFrame;
 
 pub(super) struct VirtualDevice {
-    in_buf_avail: Arc<AtomicBool>,
     in_buf: UnboundedReceiver<Vec<u8>>,
     out_buf: Sender<AnyIpPktFrame>,
 }
 
 impl VirtualDevice {
-    pub(super) fn new(
-        iface_egress_tx: Sender<AnyIpPktFrame>,
-    ) -> (Self, UnboundedSender<Vec<u8>>, Arc<AtomicBool>) {
-        let iface_ingress_tx_avail = Arc::new(AtomicBool::new(false));
+    pub(super) fn new(iface_egress_tx: Sender<AnyIpPktFrame>) -> (Self, UnboundedSender<Vec<u8>>) {
         let (iface_ingress_tx, iface_ingress_rx) = unbounded_channel();
         (
             Self {
-                in_buf_avail: iface_ingress_tx_avail.clone(),
                 in_buf: iface_ingress_rx,
                 out_buf: iface_egress_tx,
             },
             iface_ingress_tx,
-            iface_ingress_tx_avail,
         )
     }
 }
@@ -42,12 +31,10 @@ impl Device for VirtualDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let Ok(buffer) = self.in_buf.try_recv() else {
-            self.in_buf_avail.store(false, Ordering::Release);
             return None;
         };
 
         let Ok(permit) = self.out_buf.try_reserve() else {
-            self.in_buf_avail.store(false, Ordering::Release);
             return None;
         };
 

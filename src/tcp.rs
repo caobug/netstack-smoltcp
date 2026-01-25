@@ -2,10 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
@@ -114,7 +111,6 @@ impl TcpListenerRunner {
         device: VirtualDevice,
         iface: Interface,
         iface_tx: UnboundedSender<Vec<u8>>,
-        iface_ready: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         sockets: HashMap<SocketHandle, SharedControl>,
@@ -123,17 +119,10 @@ impl TcpListenerRunner {
             let notify = Arc::new(Notify::new());
             let (conn_tx, conn_rx) = unbounded_channel::<NewConnection>();
 
-            let packet_handler = Self::handle_packets(
-                notify.clone(),
-                iface_tx,
-                iface_ready.clone(),
-                tcp_rx,
-                stream_tx,
-                conn_tx,
-            );
+            let packet_handler =
+                Self::handle_packets(notify.clone(), iface_tx, tcp_rx, stream_tx, conn_tx);
 
-            let socket_handler =
-                Self::handle_sockets(notify, device, iface, iface_ready, sockets, conn_rx);
+            let socket_handler = Self::handle_sockets(notify, device, iface, sockets, conn_rx);
 
             tokio::select! {
                 result = packet_handler => result,
@@ -148,7 +137,6 @@ impl TcpListenerRunner {
     async fn handle_packets(
         notify: SharedNotify,
         iface_tx: UnboundedSender<Vec<u8>>,
-        iface_ready: Arc<AtomicBool>,
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         conn_tx: UnboundedSender<NewConnection>,
@@ -163,7 +151,7 @@ impl TcpListenerRunner {
             };
 
             if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6) {
-                Self::forward_packet(&iface_tx, &iface_ready, &notify, frame)?;
+                Self::forward_packet(&iface_tx, &notify, frame)?;
                 continue;
             }
 
@@ -191,7 +179,7 @@ impl TcpListenerRunner {
                 trace!("New connection: {} -> {}", src_addr, dst_addr);
             }
 
-            Self::forward_packet(&iface_tx, &iface_ready, &notify, frame)?;
+            Self::forward_packet(&iface_tx, &notify, frame)?;
         }
         Ok(())
     }
@@ -226,14 +214,12 @@ impl TcpListenerRunner {
 
     fn forward_packet(
         iface_tx: &UnboundedSender<Vec<u8>>,
-        iface_ready: &Arc<AtomicBool>,
         notify: &SharedNotify,
         frame: Vec<u8>,
     ) -> std::io::Result<()> {
         iface_tx
             .send(frame)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-        iface_ready.store(true, Ordering::Release);
         notify.notify_one();
         Ok(())
     }
@@ -242,7 +228,6 @@ impl TcpListenerRunner {
         notify: SharedNotify,
         mut device: VirtualDevice,
         mut iface: Interface,
-        iface_ready: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
         mut conn_rx: UnboundedReceiver<NewConnection>,
     ) -> std::io::Result<()> {
@@ -264,18 +249,16 @@ impl TcpListenerRunner {
                 socket_set.remove(handle);
             }
 
-            if !iface_ready.swap(false, Ordering::AcqRel) {
-                let next_duration = iface
-                    .poll_delay(poll_start, &socket_set)
-                    .unwrap_or(Duration::from_millis(5));
+            let next_duration = iface
+                .poll_delay(poll_start, &socket_set)
+                .unwrap_or(Duration::from_millis(5));
 
-                if next_duration != Duration::ZERO {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from(next_duration),
-                        notify.notified(),
-                    )
-                    .await;
-                }
+            if next_duration != Duration::ZERO {
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_micros(next_duration.total_micros()),
+                    notify.notified(),
+                )
+                .await;
             }
         }
     }
@@ -387,9 +370,7 @@ impl TcpListenerRunner {
             ctrl.wake_sender();
         }
 
-        if should_wake_shutdown {
-            ctrl.wake_shutdown();
-        } else if ctrl.ready_to_initiate_close() {
+        if should_wake_shutdown || ctrl.ready_to_initiate_close() {
             ctrl.wake_shutdown();
         }
     }
@@ -404,19 +385,12 @@ impl TcpListener {
         tcp_rx: Receiver<AnyIpPktFrame>,
         stack_tx: Sender<AnyIpPktFrame>,
     ) -> std::io::Result<(Runner, Self)> {
-        let (mut device, iface_tx, iface_ready) = VirtualDevice::new(stack_tx);
+        let (mut device, iface_tx) = VirtualDevice::new(stack_tx);
         let iface = Self::create_interface(&mut device)?;
         let (stream_tx, stream_rx) = unbounded_channel();
 
-        let runner = TcpListenerRunner::create(
-            device,
-            iface,
-            iface_tx,
-            iface_ready,
-            tcp_rx,
-            stream_tx,
-            HashMap::new(),
-        );
+        let runner =
+            TcpListenerRunner::create(device, iface, iface_tx, tcp_rx, stream_tx, HashMap::new());
 
         Ok((runner, Self { stream_rx }))
     }

@@ -182,7 +182,7 @@ impl WriteHalf {
 
         builder
             .write(&mut buffer, &msg.payload)
-            .map_err(|e| UdpError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| UdpError::IoError(std::io::Error::other(e)))?;
 
         Ok(buffer)
     }
