@@ -30,22 +30,16 @@ impl Device for VirtualDevice {
     type TxToken<'a> = VirtualTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let Ok(buffer) = self.in_buf.try_recv() else {
-            return None;
-        };
-
-        let Ok(permit) = self.out_buf.try_reserve() else {
-            return None;
-        };
-
+        let permit = self.out_buf.try_reserve().ok()?;
+        let buffer = self.in_buf.try_recv().ok()?;
         Some((Self::RxToken { buffer }, Self::TxToken { permit }))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        match self.out_buf.try_reserve() {
-            Ok(permit) => Some(Self::TxToken { permit }),
-            Err(_) => None,
-        }
+        self.out_buf
+            .try_reserve()
+            .ok()
+            .map(|permit| Self::TxToken { permit })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
